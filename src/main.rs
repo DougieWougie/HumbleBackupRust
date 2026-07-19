@@ -4,8 +4,11 @@ mod downloader;
 mod naming;
 
 use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
@@ -13,7 +16,7 @@ use tokio::sync::Semaphore;
 
 use api::{build_tasks, ApiError, HumbleClient, HumbleClientError};
 use auth::firefox_session_cookie;
-use downloader::already_present;
+use downloader::{already_present, download_all, DownloadResult, DownloadTask, Status};
 
 #[derive(Parser, Debug)]
 #[command(name = "hbsync", about = "Sync Humble Bundle ebook purchases to local disk.")]
@@ -137,7 +140,49 @@ fn map_client_err(err: HumbleClientError) -> anyhow::Error {
     }
 }
 
-// Placeholder — replaced in Task 9 with the real download/progress-bar path.
-async fn run_downloads(_tasks: Vec<downloader::DownloadTask>, _cli: &Cli, key_failures: u32) -> Result<u8> {
-    Ok(if key_failures > 0 { 1 } else { 0 })
+async fn run_downloads(tasks: Vec<DownloadTask>, cli: &Cli, key_failures: u32) -> Result<u8> {
+    let use_bar = std::io::stdout().is_terminal();
+    let bar = use_bar.then(|| {
+        let bar = indicatif::ProgressBar::new(tasks.len() as u64);
+        bar.set_style(
+            indicatif::ProgressStyle::with_template("[{bar:20.green/white}] {percent}% ({pos}/{len}){msg}")
+                .expect("valid template")
+                .progress_chars("█-"),
+        );
+        bar
+    });
+    let failed_count = AtomicU64::new(0);
+    let on_result = |result: &DownloadResult| {
+        if let Some(bar) = &bar {
+            if matches!(result.status, Status::Failed(_)) {
+                let n = failed_count.fetch_add(1, Ordering::SeqCst) + 1;
+                bar.set_message(format!(" \u{b7} {n} failed"));
+            }
+            bar.inc(1);
+        }
+    };
+
+    let http_client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
+    let backoff = [Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(4)];
+    let results = download_all(tasks, cli.parallel.max(1), http_client, &backoff, Some(&on_result)).await;
+    if let Some(bar) = &bar {
+        bar.finish();
+        println!();
+    }
+
+    let mut downloaded = 0u32;
+    let mut skipped = 0u32;
+    let mut failed = 0u32;
+    for result in &results {
+        match &result.status {
+            Status::Downloaded => downloaded += 1,
+            Status::Skipped => skipped += 1,
+            Status::Failed(err) => {
+                failed += 1;
+                println!("\u{2717} {} ({err})", result.task.dest.display());
+            }
+        }
+    }
+    println!("\n{downloaded} downloaded, {skipped} skipped, {failed} failed");
+    Ok(if failed > 0 || key_failures > 0 { 1 } else { 0 })
 }

@@ -1,7 +1,7 @@
 //! Humble Bundle JSON API client and order-to-download-task mapping.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -200,6 +200,7 @@ fn filename_from_url(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn fixture() -> Value {
         serde_json::from_str(include_str!("../tests/fixtures/order_sample.json")).unwrap()
