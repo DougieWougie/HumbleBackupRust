@@ -1,0 +1,71 @@
+{
+  "gamekey": "CWPBwb82sqPXqEsq",
+  "product": {
+    "human_name": "Humble Tech Book Bundle: Intelligent Agents: Agentic AI and Large Language Models by Apress",
+    "machine_name": "intelligentagents_bookbundle"
+  },
+  "subproducts": [
+    {
+      "human_name": "Building Agentic AI Systems",
+      "payee": {"human_name": "Apress", "machine_name": "apress"},
+      "downloads": [
+        {
+          "platform": "ebook",
+          "machine_name": "buildingagentic_ebook",
+          "download_struct": [
+            {
+              "name": "EPUB",
+              "url": {"web": "https://dl.humble.com/apress/Building_Agentic_AI_Systems.epub?gamekey=CWPBwb82sqPXqEsq&ttl=1"},
+              "file_size": 1048576,
+              "md5": "0123456789abcdef0123456789abcdef",
+              "human_size": "1 MB"
+            },
+            {
+              "name": "PDF",
+              "url": {"web": "https://dl.humble.com/apress/Building_Agentic_AI_Systems.pdf?ttl=1"},
+              "file_size": 2097152,
+              "md5": "fedcba9876543210fedcba9876543210",
+              "human_size": "2 MB"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "human_name": "Steam Key Only Item",
+      "payee": {"human_name": "Some Studio", "machine_name": "somestudio"},
+      "downloads": []
+    },
+    {
+      "human_name": "LLMs in Production",
+      "payee": {"human_name": "Apress", "machine_name": "apress"},
+      "downloads": [
+        {
+          "platform": "ebook",
+          "machine_name": "llmsprod_ebook",
+          "download_struct": [
+            {
+              "name": "MOBI",
+              "url": {"web": "https://dl.humble.com/apress/LLMs_in_Production.mobi?ttl=1"},
+              "file_size": 3145728,
+              "md5": "00112233445566778899aabbccddeeff",
+              "human_size": "3 MB"
+            }
+          ]
+        },
+        {
+          "platform": "video",
+          "machine_name": "llmsprod_video",
+          "download_struct": [
+            {
+              "name": "Download",
+              "url": {"web": "https://dl.humble.com/apress/llms_video.zip?ttl=1"},
+              "file_size": 999,
+              "human_size": "999 B"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
