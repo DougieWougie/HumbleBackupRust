@@ -2,11 +2,83 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::Value;
+use thiserror::Error;
 
+use crate::auth::AuthError;
 use crate::downloader::DownloadTask;
 use crate::naming::{parse_bundle_title, sanitize};
+
+const API_BASE: &str = "https://www.humblebundle.com/api/v1";
+
+const SESSION_REJECTED_MSG: &str = "Humble Bundle rejected the session cookie. \
+Log into humblebundle.com in Firefox and re-run, or pass --cookie.";
+
+#[derive(Debug, Error)]
+pub enum ApiError {
+    #[error("not found: {0}")]
+    NotFound(String),
+}
+
+#[derive(Debug, Error)]
+pub enum HumbleClientError {
+    #[error(transparent)]
+    Auth(#[from] AuthError),
+    #[error(transparent)]
+    Api(#[from] ApiError),
+    #[error(transparent)]
+    Network(#[from] reqwest::Error),
+}
+
+pub struct HumbleClient {
+    client: reqwest::Client,
+    base_url: String,
+    cookie: String,
+}
+
+impl HumbleClient {
+    pub fn new(session_cookie: &str) -> Result<Self, HumbleClientError> {
+        let base_url = std::env::var("HBSYNC_API_BASE").unwrap_or_else(|_| API_BASE.to_string());
+        let client = reqwest::Client::builder()
+            .user_agent("hbsync/0.1")
+            .timeout(Duration::from_secs(30))
+            .build()?;
+        Ok(Self { client, base_url, cookie: session_cookie.to_string() })
+    }
+
+    pub async fn list_order_keys(&self) -> Result<Vec<String>, HumbleClientError> {
+        let data = self.get_json(&format!("{}/user/order", self.base_url)).await?;
+        Ok(data
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get("gamekey").and_then(Value::as_str).map(str::to_string))
+            .collect())
+    }
+
+    pub async fn get_order(&self, key: &str) -> Result<Order, HumbleClientError> {
+        let data = self.get_json(&format!("{}/order/{}", self.base_url, key)).await?;
+        Ok(parse_order(&data))
+    }
+
+    async fn get_json(&self, url: &str) -> Result<Value, HumbleClientError> {
+        let response = self
+            .client
+            .get(url)
+            .header("Cookie", format!("_simpleauth_sess={}", self.cookie))
+            .send()
+            .await?;
+        match response.status().as_u16() {
+            401 | 403 => return Err(HumbleClientError::Auth(AuthError(SESSION_REJECTED_MSG.to_string()))),
+            404 => return Err(HumbleClientError::Api(ApiError::NotFound(url.to_string()))),
+            _ => {}
+        }
+        let response = response.error_for_status()?;
+        Ok(response.json::<Value>().await?)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DownloadFile {
@@ -200,5 +272,76 @@ mod tests {
             tasks[0].dest.strip_prefix(&output).unwrap().to_string_lossy(),
             "Apress/Cybersecurity 2.0/epub/Building_Agentic_AI_Systems.epub"
         );
+    }
+}
+
+#[cfg(test)]
+mod client_tests {
+    use super::*;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn client_for(server: &MockServer) -> HumbleClient {
+        HumbleClient {
+            client: reqwest::Client::new(),
+            base_url: format!("{}/api/v1", server.uri()),
+            cookie: "abc".to_string(),
+        }
+    }
+
+    #[test]
+    fn api_base_uses_www_host() {
+        assert!(API_BASE.contains("www.humblebundle.com"));
+    }
+
+    #[tokio::test]
+    async fn list_order_keys_sends_cookie_and_parses() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/user/order"))
+            .and(header("cookie", "_simpleauth_sess=abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"gamekey": "KEY1"}, {"gamekey": "KEY2"}
+            ])))
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        assert_eq!(client.list_order_keys().await.unwrap(), vec!["KEY1", "KEY2"]);
+    }
+
+    #[tokio::test]
+    async fn get_order_parses_response() {
+        let server = MockServer::start().await;
+        let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/order_sample.json")).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/api/v1/order/CWPBwb82sqPXqEsq"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&fixture))
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        let order = client.get_order("CWPBwb82sqPXqEsq").await.unwrap();
+        assert_eq!(order.books.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rejected_session_raises_autherror() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).respond_with(ResponseTemplate::new(401)).mount(&server).await;
+        let client = client_for(&server).await;
+        match client.list_order_keys().await.unwrap_err() {
+            HumbleClientError::Auth(e) => assert!(e.0.contains("Log into humblebundle.com")),
+            other => panic!("expected Auth error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_key_raises_apierror() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).respond_with(ResponseTemplate::new(404)).mount(&server).await;
+        let client = client_for(&server).await;
+        match client.get_order("NOPE").await.unwrap_err() {
+            HumbleClientError::Api(ApiError::NotFound(_)) => {}
+            other => panic!("expected Api(NotFound), got {other:?}"),
+        }
     }
 }
