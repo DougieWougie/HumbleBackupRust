@@ -17,6 +17,8 @@ Directory names come from the bundle title, split the same way as the Python ori
 
 Re-runs are idempotent. A file that already exists with the expected size is skipped. Downloads stream to a `.part` file that is renamed into place only after size and MD5 checks pass. Failed downloads are retried three times with backoff, and the exit code is nonzero if anything ultimately failed.
 
+Order metadata (titles, sizes, MD5s, formats — everything except the signed download URL, which expires) is cached under `~/.cache/hbsync/orders/` after the first fetch, since a bundle's contents never change once purchased. On a re-run, if every file an order would produce is already on disk, that order is resolved entirely from the cache with no network request; only orders with something still missing are refetched (which also refreshes the cache entry). This makes repeat syncs of a mostly-downloaded library fast even with a large number of bundles. Pass `--refresh` to bypass the cache and refetch everything.
+
 ## Architecture
 
 ```
@@ -24,6 +26,7 @@ src/
 ├── main.rs       clap CLI, wiring, indicatif progress bar, exit codes
 ├── auth.rs       Firefox profile discovery and session cookie extraction
 ├── api.rs        HumbleClient, order JSON parsing, download task building
+├── cache.rs      on-disk cache of parsed order metadata, keyed by gamekey
 ├── naming.rs     bundle title heuristic and filesystem-safe sanitizing
 └── downloader.rs tokio + reqwest parallel downloads with skip/verify/retry
 ```
@@ -46,6 +49,7 @@ hbsync --formats epub,pdf         # restrict formats (default: all offered)
 hbsync --parallel 8               # concurrent downloads (default: 4)
 hbsync --list                     # show what would be downloaded, download nothing
 hbsync --cookie <value>           # use this session cookie instead of reading Firefox
+hbsync --refresh                  # bypass the order metadata cache and refetch everything
 ```
 
 You must be logged into humblebundle.com in Firefox (or supply `--cookie`).

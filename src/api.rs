@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -80,7 +81,7 @@ impl HumbleClient {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadFile {
     pub format: String,
     pub url: String,
@@ -88,16 +89,15 @@ pub struct DownloadFile {
     pub md5: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Book {
     pub title: String,
     pub publisher: Option<String>,
     pub files: Vec<DownloadFile>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Order {
-    #[allow(dead_code)] // part of the parsed order shape; asserted in tests, unused by the CLI today
     pub key: String,
     pub title: String,
     pub books: Vec<Book>,

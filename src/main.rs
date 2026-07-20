@@ -1,11 +1,12 @@
 mod api;
 mod auth;
+mod cache;
 mod downloader;
 mod naming;
 
 use std::collections::HashSet;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +44,10 @@ struct Cli {
     /// Humble Bundle _simpleauth_sess cookie value (default: read from Firefox)
     #[arg(long)]
     cookie: Option<String>,
+
+    /// bypass the order metadata cache and refetch everything from Humble Bundle
+    #[arg(long)]
+    refresh: bool,
 }
 
 fn parse_key(arg: &str) -> String {
@@ -87,13 +92,26 @@ async fn run(cli: Cli, formats: Option<HashSet<String>>) -> Result<u8> {
         cli.keys.iter().map(|k| parse_key(k)).collect()
     };
 
+    let cache_dir = cache::cache_dir();
     let semaphore = Arc::new(Semaphore::new(cli.parallel.max(1)));
     let fetches = keys.iter().map(|key| {
         let client = &client;
         let semaphore = Arc::clone(&semaphore);
+        let cache_dir = cache_dir.clone();
+        let output = cli.output.clone();
+        let formats = formats.clone();
         async move {
             let _permit = semaphore.acquire().await.expect("semaphore closed");
-            (key.to_string(), client.get_order(key).await)
+            let result = resolve_tasks(
+                client,
+                key,
+                &output,
+                formats.as_ref(),
+                cache_dir.as_deref(),
+                cli.refresh,
+            )
+            .await;
+            (key.to_string(), result)
         }
     });
     let fetched = futures::future::join_all(fetches).await;
@@ -102,7 +120,7 @@ async fn run(cli: Cli, formats: Option<HashSet<String>>) -> Result<u8> {
     let mut key_failures: u32 = 0;
     for (key, result) in fetched {
         match result {
-            Ok(order) => tasks.extend(build_tasks(&order, &cli.output, formats.as_ref())),
+            Ok(order_tasks) => tasks.extend(order_tasks),
             Err(HumbleClientError::Api(ApiError::NotFound(msg))) => {
                 eprintln!("\u{2717} {key}: not found: {msg}");
                 key_failures += 1;
@@ -130,6 +148,37 @@ async fn run(cli: Cli, formats: Option<HashSet<String>>) -> Result<u8> {
     }
 
     run_downloads(tasks, &cli, key_failures).await
+}
+
+/// Resolve the download tasks for one order key, preferring the cache.
+///
+/// A cache hit only avoids the network call when every task it produces is
+/// already present on disk — otherwise the signed URLs it holds may have
+/// expired, so a fresh fetch is needed anyway, and that fresh order is
+/// written back to the cache.
+async fn resolve_tasks(
+    client: &HumbleClient,
+    key: &str,
+    output: &Path,
+    formats: Option<&HashSet<String>>,
+    cache_dir: Option<&Path>,
+    refresh: bool,
+) -> Result<Vec<DownloadTask>, HumbleClientError> {
+    if !refresh {
+        if let Some(dir) = cache_dir {
+            if let Some(cached) = cache::load_order(dir, key) {
+                let tasks = build_tasks(&cached, output, formats);
+                if tasks.iter().all(already_present) {
+                    return Ok(tasks);
+                }
+            }
+        }
+    }
+    let order = client.get_order(key).await?;
+    if let Some(dir) = cache_dir {
+        cache::save_order(dir, key, &order);
+    }
+    Ok(build_tasks(&order, output, formats))
 }
 
 fn map_client_err(err: HumbleClientError) -> anyhow::Error {
