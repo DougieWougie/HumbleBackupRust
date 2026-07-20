@@ -33,7 +33,7 @@ pub struct DownloadResult {
 
 pub fn already_present(task: &DownloadTask) -> bool {
     match std::fs::metadata(&task.dest) {
-        Ok(meta) => task.size.map_or(true, |size| meta.len() == size),
+        Ok(meta) => task.size.is_none_or(|size| meta.len() == size),
         Err(_) => false,
     }
 }

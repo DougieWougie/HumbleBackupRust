@@ -88,12 +88,12 @@ async fn run(cli: Cli, formats: Option<HashSet<String>>) -> Result<u8> {
     };
 
     let semaphore = Arc::new(Semaphore::new(cli.parallel.max(1)));
-    let fetches = keys.iter().cloned().map(|key| {
+    let fetches = keys.iter().map(|key| {
         let client = &client;
         let semaphore = Arc::clone(&semaphore);
         async move {
             let _permit = semaphore.acquire().await.expect("semaphore closed");
-            (key.clone(), client.get_order(&key).await)
+            (key.to_string(), client.get_order(key).await)
         }
     });
     let fetched = futures::future::join_all(fetches).await;

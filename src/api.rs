@@ -97,6 +97,7 @@ pub struct Book {
 
 #[derive(Debug, Clone)]
 pub struct Order {
+    #[allow(dead_code)] // part of the parsed order shape; asserted in tests, unused by the CLI today
     pub key: String,
     pub title: String,
     pub books: Vec<Book>,
