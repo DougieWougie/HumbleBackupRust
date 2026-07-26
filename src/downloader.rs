@@ -25,10 +25,21 @@ pub enum Status {
     Failed(String),
 }
 
+/// The size/md5 actually observed for a download whose result disagreed
+/// with the order metadata the task was built from. Callers that persist
+/// order metadata (see `cache.rs`) should patch it with these values so
+/// future runs recognize the file as already present.
+#[derive(Debug, Clone)]
+pub struct CorrectedMetadata {
+    pub size: u64,
+    pub md5: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct DownloadResult {
     pub task: DownloadTask,
     pub status: Status,
+    pub corrected: Option<CorrectedMetadata>,
 }
 
 pub fn already_present(task: &DownloadTask) -> bool {
@@ -79,7 +90,7 @@ async fn download_one(
     backoff: &[Duration],
 ) -> DownloadResult {
     if already_present(&task) {
-        return DownloadResult { task, status: Status::Skipped };
+        return DownloadResult { task, status: Status::Skipped, corrected: None };
     }
     let mut last_error = "unknown error".to_string();
     for attempt in 0..=backoff.len() {
@@ -87,11 +98,13 @@ async fn download_one(
             tokio::time::sleep(backoff[attempt - 1]).await;
         }
         match fetch(client, &task).await {
-            Ok(()) => return DownloadResult { task, status: Status::Downloaded },
+            Ok(corrected) => {
+                return DownloadResult { task, status: Status::Downloaded, corrected };
+            }
             Err(err) => last_error = err.to_string(),
         }
     }
-    DownloadResult { task, status: Status::Failed(last_error) }
+    DownloadResult { task, status: Status::Failed(last_error), corrected: None }
 }
 
 fn part_path_for(dest: &Path) -> PathBuf {
@@ -100,7 +113,10 @@ fn part_path_for(dest: &Path) -> PathBuf {
     dest.with_file_name(name)
 }
 
-async fn fetch(client: &reqwest::Client, task: &DownloadTask) -> Result<(), FetchError> {
+async fn fetch(
+    client: &reqwest::Client,
+    task: &DownloadTask,
+) -> Result<Option<CorrectedMetadata>, FetchError> {
     if let Some(parent) = task.dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -116,8 +132,15 @@ async fn fetch_inner(
     client: &reqwest::Client,
     task: &DownloadTask,
     part_path: &Path,
-) -> Result<(), FetchError> {
+) -> Result<Option<CorrectedMetadata>, FetchError> {
     let response = client.get(&task.url).send().await?.error_for_status()?;
+    // Humble's order-detail API can report stale size/md5 for books that were
+    // re-uploaded after purchase (revised editions, retranscodes). The
+    // Content-Length of this exact response reflects what the server is
+    // actually about to send, so it's the trustworthy check for truncation;
+    // order metadata is only used as a fallback when Content-Length is absent.
+    let content_length = response.content_length();
+    let metadata_stale = matches!((task.size, content_length), (Some(s), Some(c)) if s != c);
     let mut stream = response.bytes_stream();
     let mut file = tokio::fs::File::create(part_path).await?;
     let mut hasher = Md5::new();
@@ -131,19 +154,28 @@ async fn fetch_inner(
     file.flush().await?;
     drop(file);
 
-    if let Some(expected) = task.size {
+    if let Some(expected) = content_length.or(task.size) {
         if actual_size != expected {
             return Err(FetchError::SizeMismatch { actual: actual_size, expected });
         }
     }
-    if let Some(expected_md5) = &task.md5 {
-        let digest = format!("{:x}", hasher.finalize());
-        if &digest != expected_md5 {
-            return Err(FetchError::Md5Mismatch);
+    let digest = format!("{:x}", hasher.finalize());
+    let corrected = if metadata_stale {
+        eprintln!(
+            "\u{26a0} {}: order metadata disagrees with the live download; caching corrected size/md5",
+            task.dest.display()
+        );
+        Some(CorrectedMetadata { size: actual_size, md5: digest })
+    } else {
+        if let Some(expected_md5) = &task.md5 {
+            if &digest != expected_md5 {
+                return Err(FetchError::Md5Mismatch);
+            }
         }
-    }
+        None
+    };
     tokio::fs::rename(part_path, &task.dest).await?;
-    Ok(())
+    Ok(corrected)
 }
 
 #[cfg(test)]
@@ -296,6 +328,29 @@ mod tests {
         }
         assert!(!dest.exists());
         assert!(!dir.path().join("book.epub.part").exists());
+    }
+
+    #[tokio::test]
+    async fn stale_order_metadata_does_not_fail_a_complete_download() {
+        // Humble's order-detail API can report a stale size/md5 for a book
+        // that was re-uploaded after purchase. The live Content-Length of
+        // the response should win over that stale metadata.
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/book.epub"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(CONTENT))
+            .mount(&server).await;
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("book.epub");
+        let task = DownloadTask {
+            url: format!("{}/book.epub", server.uri()),
+            dest: dest.clone(),
+            size: Some(CONTENT.len() as u64 + 1000),
+            md5: Some("0".repeat(32)),
+        };
+        let client = reqwest::Client::new();
+        let results = download_all(vec![task], 1, client, &[], None).await;
+        assert_eq!(results[0].status, Status::Downloaded);
+        assert_eq!(std::fs::read(&dest).unwrap(), CONTENT);
     }
 
     #[tokio::test]

@@ -117,10 +117,14 @@ async fn run(cli: Cli, formats: Option<HashSet<String>>) -> Result<u8> {
     let fetched = futures::future::join_all(fetches).await;
 
     let mut tasks = Vec::new();
+    let mut orders: std::collections::HashMap<String, api::Order> = std::collections::HashMap::new();
     let mut key_failures: u32 = 0;
     for (key, result) in fetched {
         match result {
-            Ok(order_tasks) => tasks.extend(order_tasks),
+            Ok((order, order_tasks)) => {
+                tasks.extend(order_tasks);
+                orders.insert(key, order);
+            }
             Err(HumbleClientError::Api(ApiError::NotFound(msg))) => {
                 eprintln!("\u{2717} {key}: not found: {msg}");
                 key_failures += 1;
@@ -147,7 +151,7 @@ async fn run(cli: Cli, formats: Option<HashSet<String>>) -> Result<u8> {
         return Ok(if key_failures > 0 { 1 } else { 0 });
     }
 
-    run_downloads(tasks, &cli, key_failures).await
+    run_downloads(tasks, &cli, key_failures, orders, cache_dir).await
 }
 
 /// Resolve the download tasks for one order key, preferring the cache.
@@ -163,13 +167,13 @@ async fn resolve_tasks(
     formats: Option<&HashSet<String>>,
     cache_dir: Option<&Path>,
     refresh: bool,
-) -> Result<Vec<DownloadTask>, HumbleClientError> {
+) -> Result<(api::Order, Vec<DownloadTask>), HumbleClientError> {
     if !refresh {
         if let Some(dir) = cache_dir {
             if let Some(cached) = cache::load_order(dir, key) {
                 let tasks = build_tasks(&cached, output, formats);
                 if tasks.iter().all(already_present) {
-                    return Ok(tasks);
+                    return Ok((cached, tasks));
                 }
             }
         }
@@ -178,7 +182,8 @@ async fn resolve_tasks(
     if let Some(dir) = cache_dir {
         cache::save_order(dir, key, &order);
     }
-    Ok(build_tasks(&order, output, formats))
+    let tasks = build_tasks(&order, output, formats);
+    Ok((order, tasks))
 }
 
 fn map_client_err(err: HumbleClientError) -> anyhow::Error {
@@ -189,7 +194,13 @@ fn map_client_err(err: HumbleClientError) -> anyhow::Error {
     }
 }
 
-async fn run_downloads(tasks: Vec<DownloadTask>, cli: &Cli, key_failures: u32) -> Result<u8> {
+async fn run_downloads(
+    tasks: Vec<DownloadTask>,
+    cli: &Cli,
+    key_failures: u32,
+    mut orders: std::collections::HashMap<String, api::Order>,
+    cache_dir: Option<PathBuf>,
+) -> Result<u8> {
     let use_bar = std::io::stdout().is_terminal();
     let bar = use_bar.then(|| {
         let bar = indicatif::ProgressBar::new(tasks.len() as u64);
@@ -219,6 +230,8 @@ async fn run_downloads(tasks: Vec<DownloadTask>, cli: &Cli, key_failures: u32) -
         println!();
     }
 
+    apply_corrections(&results, &mut orders, cache_dir.as_deref());
+
     let mut downloaded = 0u32;
     let mut skipped = 0u32;
     let mut failed = 0u32;
@@ -234,4 +247,38 @@ async fn run_downloads(tasks: Vec<DownloadTask>, cli: &Cli, key_failures: u32) -
     }
     println!("\n{downloaded} downloaded, {skipped} skipped, {failed} failed");
     Ok(if failed > 0 || key_failures > 0 { 1 } else { 0 })
+}
+
+/// Patch cached order metadata with the size/md5 actually observed for
+/// downloads that disagreed with it, so a future run's `already_present`
+/// check recognizes these files as complete instead of re-downloading them
+/// forever (see downloader::CorrectedMetadata).
+fn apply_corrections(
+    results: &[DownloadResult],
+    orders: &mut std::collections::HashMap<String, api::Order>,
+    cache_dir: Option<&Path>,
+) {
+    let Some(cache_dir) = cache_dir else { return };
+    let mut changed_keys: HashSet<String> = HashSet::new();
+    for result in results {
+        let Some(corrected) = &result.corrected else { continue };
+        for (key, order) in orders.iter_mut() {
+            let found = order
+                .books
+                .iter_mut()
+                .flat_map(|book| book.files.iter_mut())
+                .find(|file| file.url == result.task.url);
+            if let Some(file) = found {
+                file.size = Some(corrected.size);
+                file.md5 = Some(corrected.md5.clone());
+                changed_keys.insert(key.clone());
+                break;
+            }
+        }
+    }
+    for key in changed_keys {
+        if let Some(order) = orders.get(&key) {
+            cache::save_order(cache_dir, &key, order);
+        }
+    }
 }

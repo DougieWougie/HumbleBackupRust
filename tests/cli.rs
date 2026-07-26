@@ -215,6 +215,103 @@ async fn refresh_flag_bypasses_warm_cache() {
     assert_eq!(calls.load(Ordering::SeqCst), 2, "--refresh must bypass the cache and refetch");
 }
 
+/// Simulates a book that Humble re-uploaded after purchase: the order API
+/// still reports the old size/md5, but the CDN serves the current (correct)
+/// file. The download should succeed against the live size, and the cache
+/// should be corrected so a second run recognizes the file as already
+/// present without hitting the order endpoint again.
+#[tokio::test]
+async fn stale_order_metadata_self_heals_the_cache() {
+    const CONTENT: &[u8] = b"the current, correct edition of this book";
+    let server = MockServer::start().await;
+    let order_calls = Arc::new(AtomicUsize::new(0));
+
+    let order = |server_uri: &str| {
+        serde_json::json!({
+            "gamekey": "STALEKEY00000001",
+            "product": {"human_name": "Some Bundle by Some Publisher", "machine_name": "somebundle_bookbundle"},
+            "subproducts": [{
+                "human_name": "A Book",
+                "payee": {"human_name": "Some Publisher", "machine_name": "somepublisher"},
+                "downloads": [{
+                    "platform": "ebook",
+                    "machine_name": "abook_ebook",
+                    "download_struct": [{
+                        "name": "EPUB",
+                        "url": {"web": format!("{server_uri}/dl/book.epub")},
+                        "file_size": 999999,
+                        "md5": "0".repeat(32),
+                        "human_size": "977 KB"
+                    }]
+                }]
+            }]
+        })
+    };
+    struct OrderResponder {
+        calls: Arc<AtomicUsize>,
+        body: serde_json::Value,
+    }
+    impl Respond for OrderResponder {
+        fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(&self.body)
+        }
+    }
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/order/.*$"))
+        .respond_with(OrderResponder { calls: Arc::clone(&order_calls), body: order(&server.uri()) })
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/dl/book\.epub$"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(CONTENT))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    let first = hbsync_cmd(&server, cache.path())
+        .args(["--cookie", "x", "-o"])
+        .arg(tmp.path())
+        .arg("STALEKEY00000001")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&first.stdout);
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(first.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("1 downloaded, 0 skipped, 0 failed"), "stdout: {stdout}");
+    assert!(stderr.contains("order metadata disagrees"), "stderr: {stderr}");
+    assert_eq!(order_calls.load(Ordering::SeqCst), 1);
+
+    let downloaded_path =
+        tmp.path().join("Some Publisher").join("Some Bundle").join("epub").join("book.epub");
+    assert_eq!(std::fs::read(&downloaded_path).unwrap(), CONTENT);
+
+    let cache_entry = std::fs::read_dir(cache.path())
+        .unwrap()
+        .next()
+        .expect("cache entry should exist")
+        .unwrap()
+        .path();
+    let cached: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(cache_entry).unwrap()).unwrap();
+    let cached_size = cached["books"][0]["files"][0]["size"].as_u64().unwrap();
+    assert_eq!(cached_size, CONTENT.len() as u64, "cache should be corrected to the live size");
+
+    // Second run: the file on disk now matches the corrected cache entry, so
+    // it should be recognized as already present with no further network calls.
+    let second = hbsync_cmd(&server, cache.path())
+        .args(["--list", "--cookie", "x", "-o"])
+        .arg(tmp.path())
+        .arg("STALEKEY00000001")
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    assert_eq!(order_calls.load(Ordering::SeqCst), 1, "second run must reuse the corrected cache");
+    let second_stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(second_stdout.contains("1 available, 1 already downloaded, 0 to download"), "{second_stdout}");
+}
+
 #[tokio::test]
 async fn cache_miss_with_missing_file_still_refetches() {
     let server = server_with_order().await;
