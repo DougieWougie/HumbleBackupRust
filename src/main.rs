@@ -213,6 +213,18 @@ async fn run_downloads(
     });
     let failed_count = AtomicU64::new(0);
     let on_result = |result: &DownloadResult| {
+        if result.corrected.is_some() {
+            let msg = format!(
+                "\u{26a0} {}: order metadata disagreed with the live download; corrected",
+                result.task.dest.display()
+            );
+            // Route through the bar so the warning prints above it instead of
+            // colliding with its in-place redraw (which looks like a restart).
+            match &bar {
+                Some(bar) => bar.println(msg),
+                None => eprintln!("{msg}"),
+            }
+        }
         if let Some(bar) = &bar {
             if matches!(result.status, Status::Failed(_)) {
                 let n = failed_count.fetch_add(1, Ordering::SeqCst) + 1;

@@ -161,10 +161,6 @@ async fn fetch_inner(
     }
     let digest = format!("{:x}", hasher.finalize());
     let corrected = if metadata_stale {
-        eprintln!(
-            "\u{26a0} {}: order metadata disagrees with the live download; caching corrected size/md5",
-            task.dest.display()
-        );
         Some(CorrectedMetadata { size: actual_size, md5: digest })
     } else {
         if let Some(expected_md5) = &task.md5 {
