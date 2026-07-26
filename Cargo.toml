@@ -12,7 +12,13 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "sync"] }
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "http2",
+    "charset",
+    "rustls-tls",
+] }
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -30,3 +36,8 @@ urlencoding = "2"
 wiremock = "0.6"
 assert_cmd = "2"
 predicates = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

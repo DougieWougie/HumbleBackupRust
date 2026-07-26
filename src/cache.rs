@@ -37,12 +37,48 @@ pub fn load_order(dir: &Path, key: &str) -> Option<Order> {
     serde_json::from_str(&data).ok()
 }
 
+/// Cached orders hold the signed, `ttl`-bearing download URLs for the whole
+/// library, so they are readable only by their owner.
+#[cfg(unix)]
+fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    // `mode` only applies when creating, so tighten entries that an earlier
+    // version of hbsync may have left world-readable.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(data)
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, data)
+}
+
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
 pub fn save_order(dir: &Path, key: &str, order: &Order) {
-    if std::fs::create_dir_all(dir).is_err() {
+    if create_private_dir(dir).is_err() {
         return;
     }
     if let Ok(data) = serde_json::to_string(order) {
-        let _ = std::fs::write(entry_path(dir, key), data);
+        let _ = write_private(&entry_path(dir, key), data.as_bytes());
     }
 }
 
@@ -78,6 +114,40 @@ mod tests {
         assert_eq!(loaded.key, order.key);
         assert_eq!(loaded.title, order.title);
         assert_eq!(loaded.books[0].files[0].md5, order.books[0].files[0].md5);
+    }
+
+    /// Cache entries carry signed download URLs, so they must not be
+    /// readable by other users on the machine.
+    #[cfg(unix)]
+    #[test]
+    fn entries_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("hbsync").join("orders");
+        let order = sample_order();
+        save_order(&nested, &order.key, &order);
+
+        let entry = entry_path(&nested, &order.key);
+        assert_eq!(std::fs::metadata(&entry).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+
+    /// A cache written by an older version could be world-readable; rewriting
+    /// it must tighten the mode rather than preserve it.
+    #[cfg(unix)]
+    #[test]
+    fn rewriting_tightens_a_world_readable_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let order = sample_order();
+        let entry = entry_path(dir.path(), &order.key);
+        std::fs::write(&entry, "{}").unwrap();
+        std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        save_order(dir.path(), &order.key, &order);
+        assert_eq!(std::fs::metadata(&entry).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]

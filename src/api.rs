@@ -14,6 +14,11 @@ use crate::naming::{parse_bundle_title, sanitize};
 
 const API_BASE: &str = "https://www.humblebundle.com/api/v1";
 
+/// Total deadline for an API request. Order metadata is small, so a whole-
+/// request timeout is appropriate here (unlike file downloads, which get an
+/// idle-gap timeout instead — see `main::http_client`).
+const API_TIMEOUT: Duration = Duration::from_secs(30);
+
 const SESSION_REJECTED_MSG: &str = "Humble Bundle rejected the session cookie. \
 Log into humblebundle.com in Firefox and re-run, or pass --cookie.";
 
@@ -39,14 +44,41 @@ pub struct HumbleClient {
     cookie: String,
 }
 
+/// Resolve the API base URL, honoring `HBSYNC_API_BASE`.
+///
+/// Every request carries the Humble session cookie, so an unvalidated
+/// override would let anything able to set an environment variable redirect
+/// that cookie to a host of its choosing. The override therefore only
+/// accepts loopback addresses, which is all the integration tests need.
+fn resolve_base_url() -> String {
+    let Ok(override_url) = std::env::var("HBSYNC_API_BASE") else {
+        return API_BASE.to_string();
+    };
+    if is_loopback_url(&override_url) {
+        override_url
+    } else {
+        eprintln!(
+            "\u{26a0} ignoring HBSYNC_API_BASE={override_url}: only loopback addresses are \
+             accepted, because the session cookie is sent to this host."
+        );
+        API_BASE.to_string()
+    }
+}
+
+pub fn is_loopback_url(candidate: &str) -> bool {
+    url::Url::parse(candidate).is_ok_and(|url| match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(host)) => host == "localhost",
+        None => false,
+    })
+}
+
 impl HumbleClient {
-    pub fn new(session_cookie: &str) -> Result<Self, HumbleClientError> {
-        let base_url = std::env::var("HBSYNC_API_BASE").unwrap_or_else(|_| API_BASE.to_string());
-        let client = reqwest::Client::builder()
-            .user_agent("hbsync/0.1")
-            .timeout(Duration::from_secs(30))
-            .build()?;
-        Ok(Self { client, base_url, cookie: session_cookie.to_string() })
+    /// Takes the process-wide [`reqwest::Client`] so the connection pool is
+    /// shared with the downloader.
+    pub fn new(client: reqwest::Client, session_cookie: &str) -> Self {
+        Self { client, base_url: resolve_base_url(), cookie: session_cookie.to_string() }
     }
 
     pub async fn list_order_keys(&self) -> Result<Vec<String>, HumbleClientError> {
@@ -69,6 +101,7 @@ impl HumbleClient {
             .client
             .get(url)
             .header("Cookie", format!("_simpleauth_sess={}", self.cookie))
+            .timeout(API_TIMEOUT)
             .send()
             .await?;
         match response.status().as_u16() {
@@ -294,6 +327,18 @@ mod client_tests {
     #[test]
     fn api_base_uses_www_host() {
         assert!(API_BASE.contains("www.humblebundle.com"));
+    }
+
+    #[test]
+    fn only_loopback_overrides_are_accepted() {
+        // The session cookie goes to whatever HBSYNC_API_BASE names, so a
+        // non-loopback override must never be honored.
+        assert!(is_loopback_url("http://127.0.0.1:8080/api/v1"));
+        assert!(is_loopback_url("http://localhost:8080/api/v1"));
+        assert!(is_loopback_url("http://[::1]:8080/api/v1"));
+        assert!(!is_loopback_url("https://evil.example.com/api/v1"));
+        assert!(!is_loopback_url("https://127.0.0.1.evil.example.com/api/v1"));
+        assert!(!is_loopback_url("not a url"));
     }
 
     #[tokio::test]
