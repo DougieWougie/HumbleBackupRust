@@ -312,6 +312,36 @@ async fn stale_order_metadata_self_heals_the_cache() {
     assert!(second_stdout.contains("1 available, 1 already downloaded, 0 to download"), "{second_stdout}");
 }
 
+/// The cookie should not have to appear in argv, where other local users can
+/// read it out of the process list.
+#[tokio::test]
+async fn cookie_can_come_from_stdin_or_the_environment() {
+    let server = server_with_order().await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let cache = tempfile::tempdir().unwrap();
+    let from_stdin = hbsync_cmd(&server, cache.path())
+        .args(["--list", "--cookie-stdin", "-o"])
+        .arg(tmp.path())
+        .arg("CWPBwb82sqPXqEsq")
+        .write_stdin("sekrit\n")
+        .output()
+        .unwrap();
+    assert!(from_stdin.status.success());
+    assert!(String::from_utf8_lossy(&from_stdin.stdout).contains("3 files"));
+
+    let cache = tempfile::tempdir().unwrap();
+    let from_env = hbsync_cmd(&server, cache.path())
+        .env("HBSYNC_COOKIE", "sekrit")
+        .args(["--list", "-o"])
+        .arg(tmp.path())
+        .arg("CWPBwb82sqPXqEsq")
+        .output()
+        .unwrap();
+    assert!(from_env.status.success());
+    assert!(String::from_utf8_lossy(&from_env.stdout).contains("3 files"));
+}
+
 #[tokio::test]
 async fn cache_miss_with_missing_file_still_refetches() {
     let server = server_with_order().await;

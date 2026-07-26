@@ -5,15 +5,14 @@ mod downloader;
 mod naming;
 
 use std::collections::HashSet;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
-use tokio::sync::Semaphore;
+use futures::StreamExt;
 
 use api::{build_tasks, ApiError, HumbleClient, HumbleClientError};
 use auth::firefox_session_cookie;
@@ -41,9 +40,14 @@ struct Cli {
     #[arg(long)]
     list: bool,
 
-    /// Humble Bundle _simpleauth_sess cookie value (default: read from Firefox)
+    /// Humble Bundle _simpleauth_sess cookie value. Visible to other local
+    /// users via the process list; prefer HBSYNC_COOKIE or --cookie-stdin.
     #[arg(long)]
     cookie: Option<String>,
+
+    /// read the _simpleauth_sess cookie value from standard input
+    #[arg(long, conflicts_with = "cookie")]
+    cookie_stdin: bool,
 
     /// bypass the order metadata cache and refetch everything from Humble Bundle
     #[arg(long)]
@@ -79,12 +83,51 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
+/// Resolve the session cookie: `--cookie-stdin`, then `--cookie`, then
+/// `HBSYNC_COOKIE`, then the local Firefox profile.
+///
+/// `--cookie` is last among the explicit options for a reason — argv is
+/// readable by every other user on the machine, so the stdin and environment
+/// routes exist to keep the cookie out of the process list.
+fn resolve_cookie(cli: &Cli) -> Result<String> {
+    if cli.cookie_stdin {
+        let mut value = String::new();
+        std::io::stdin().read_to_string(&mut value).context("reading cookie from stdin")?;
+        let value = value.trim().to_string();
+        if value.is_empty() {
+            anyhow::bail!("--cookie-stdin was given but stdin was empty");
+        }
+        return Ok(value);
+    }
+    if let Some(value) = &cli.cookie {
+        return Ok(value.clone());
+    }
+    if let Some(value) = std::env::var("HBSYNC_COOKIE").ok().filter(|v| !v.trim().is_empty()) {
+        return Ok(value.trim().to_string());
+    }
+    Ok(firefox_session_cookie(None)?)
+}
+
+/// The single HTTP client shared by metadata and download requests, so both
+/// phases reuse one connection pool.
+///
+/// It deliberately sets no whole-request timeout: that would cap how long a
+/// download may take in total, failing any large ebook on a slow link. The
+/// read timeout bounds the gap between response chunks instead, which is
+/// what actually detects a stalled transfer. API requests apply their own
+/// total deadline per request (see `api::API_TIMEOUT`).
+fn http_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .user_agent(concat!("hbsync/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(30))
+        .build()?)
+}
+
 async fn run(cli: Cli, formats: Option<HashSet<String>>) -> Result<u8> {
-    let cookie = match &cli.cookie {
-        Some(c) => c.clone(),
-        None => firefox_session_cookie(None)?,
-    };
-    let client = HumbleClient::new(&cookie)?;
+    let cookie = resolve_cookie(&cli)?;
+    let http = http_client()?;
+    let client = HumbleClient::new(http.clone(), &cookie);
 
     let keys: Vec<String> = if cli.keys.is_empty() {
         client.list_order_keys().await.map_err(map_client_err)?
@@ -93,28 +136,19 @@ async fn run(cli: Cli, formats: Option<HashSet<String>>) -> Result<u8> {
     };
 
     let cache_dir = cache::cache_dir();
-    let semaphore = Arc::new(Semaphore::new(cli.parallel.max(1)));
-    let fetches = keys.iter().map(|key| {
+    let fetched: Vec<(String, _)> = futures::stream::iter(keys.iter().map(|key| {
         let client = &client;
-        let semaphore = Arc::clone(&semaphore);
-        let cache_dir = cache_dir.clone();
-        let output = cli.output.clone();
-        let formats = formats.clone();
+        let cache_dir = cache_dir.as_deref();
+        let output = &cli.output;
+        let formats = formats.as_ref();
         async move {
-            let _permit = semaphore.acquire().await.expect("semaphore closed");
-            let result = resolve_tasks(
-                client,
-                key,
-                &output,
-                formats.as_ref(),
-                cache_dir.as_deref(),
-                cli.refresh,
-            )
-            .await;
+            let result = resolve_tasks(client, key, output, formats, cache_dir, cli.refresh).await;
             (key.to_string(), result)
         }
-    });
-    let fetched = futures::future::join_all(fetches).await;
+    }))
+    .buffered(cli.parallel.max(1))
+    .collect()
+    .await;
 
     let mut tasks = Vec::new();
     let mut orders: std::collections::HashMap<String, api::Order> = std::collections::HashMap::new();
@@ -151,7 +185,7 @@ async fn run(cli: Cli, formats: Option<HashSet<String>>) -> Result<u8> {
         return Ok(if key_failures > 0 { 1 } else { 0 });
     }
 
-    run_downloads(tasks, &cli, key_failures, orders, cache_dir).await
+    run_downloads(tasks, &cli, http, key_failures, orders, cache_dir).await
 }
 
 /// Resolve the download tasks for one order key, preferring the cache.
@@ -197,6 +231,7 @@ fn map_client_err(err: HumbleClientError) -> anyhow::Error {
 async fn run_downloads(
     tasks: Vec<DownloadTask>,
     cli: &Cli,
+    http: reqwest::Client,
     key_failures: u32,
     mut orders: std::collections::HashMap<String, api::Order>,
     cache_dir: Option<PathBuf>,
@@ -213,9 +248,17 @@ async fn run_downloads(
     });
     let failed_count = AtomicU64::new(0);
     let on_result = |result: &DownloadResult| {
-        if result.corrected.is_some() {
+        if let Some(corrected) = &result.corrected {
+            let detail = match &corrected.previous_md5 {
+                Some(previous) => format!(
+                    "; checksum changed from {previous} to {} — accepted because the response \
+                     was complete",
+                    corrected.md5
+                ),
+                None => "; corrected".to_string(),
+            };
             let msg = format!(
-                "\u{26a0} {}: order metadata disagreed with the live download; corrected",
+                "\u{26a0} {}: order metadata disagreed with the live download{detail}",
                 result.task.dest.display()
             );
             // Route through the bar so the warning prints above it instead of
@@ -234,9 +277,8 @@ async fn run_downloads(
         }
     };
 
-    let http_client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
     let backoff = [Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(4)];
-    let results = download_all(tasks, cli.parallel.max(1), http_client, &backoff, Some(&on_result)).await;
+    let results = download_all(tasks, cli.parallel.max(1), http, &backoff, Some(&on_result)).await;
     if let Some(bar) = &bar {
         bar.finish();
         println!();
