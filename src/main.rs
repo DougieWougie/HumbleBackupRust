@@ -247,6 +247,7 @@ async fn run_downloads(
         bar
     });
     let failed_count = AtomicU64::new(0);
+    let corrections: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let on_result = |result: &DownloadResult| {
         if let Some(corrected) = &result.corrected {
             let detail = match &corrected.previous_md5 {
@@ -261,12 +262,9 @@ async fn run_downloads(
                 "\u{26a0} {}: order metadata disagreed with the live download{detail}",
                 result.task.dest.display()
             );
-            // Route through the bar so the warning prints above it instead of
-            // colliding with its in-place redraw (which looks like a restart).
-            match &bar {
-                Some(bar) => bar.println(msg),
-                None => eprintln!("{msg}"),
-            }
+            // Held until the bar finishes rather than printed live, so the
+            // bar stays the only line that moves during the run.
+            corrections.lock().unwrap().push(msg);
         }
         if let Some(bar) = &bar {
             if matches!(result.status, Status::Failed(_)) {
@@ -285,6 +283,10 @@ async fn run_downloads(
     }
 
     apply_corrections(&results, &mut orders, cache_dir.as_deref());
+
+    for msg in corrections.into_inner().unwrap() {
+        println!("{msg}");
+    }
 
     let mut downloaded = 0u32;
     let mut skipped = 0u32;

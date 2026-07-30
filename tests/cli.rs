@@ -281,7 +281,7 @@ async fn stale_order_metadata_self_heals_the_cache() {
     let stderr = String::from_utf8_lossy(&first.stderr);
     assert!(first.status.success(), "stdout: {stdout}\nstderr: {stderr}");
     assert!(stdout.contains("1 downloaded, 0 skipped, 0 failed"), "stdout: {stdout}");
-    assert!(stderr.contains("order metadata disagreed"), "stderr: {stderr}");
+    assert!(stdout.contains("order metadata disagreed"), "stdout: {stdout}");
     assert_eq!(order_calls.load(Ordering::SeqCst), 1);
 
     let downloaded_path =
